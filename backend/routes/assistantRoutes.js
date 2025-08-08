@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { spawn } = require("child_process");
-const Ingredient = require("../models/ingredientModel"); // Or your exact model path
+const Ingredient = require("../models/Ingredient");
 const fs = require("fs");
 const multer = require("multer");
 const path = require("path");
