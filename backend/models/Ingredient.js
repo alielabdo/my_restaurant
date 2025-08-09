@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const AutoIncrement = require('mongoose-sequence')(mongoose);
 
 const ingredientSchema = new mongoose.Schema(
   {
@@ -15,17 +16,20 @@ const ingredientSchema = new mongoose.Schema(
     },
     currentStock: {
       type: Number,
-      default: 0, // Can represent quantity in kg, liters, or pieces
+      default: 0,
     },
     alertThreshold: {
       type: Number,
-      default: 0, // When stock drops below this, notify
+      default: 0,
     },
   },
   {
     timestamps: true,
   }
 );
+
+// Auto-increment plugin
+ingredientSchema.plugin(AutoIncrement, { inc_field: 'id' });
 
 const Ingredient = mongoose.model('Ingredient', ingredientSchema);
 
