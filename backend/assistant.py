@@ -12,7 +12,7 @@ import os
 import json
 import asyncio
 import requests
-from typing import List, Dict
+from typing import List, Dict, Tuple, Set
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -66,19 +66,49 @@ def get_ingredient_availability() -> Dict[str, int]:
         print(f"Error loading ingredients: {e}")
         return {}
 
+# --- Domain Guard ---
+def is_restaurant_domain(text: str) -> bool:
+    """Rudimentary domain guard: only allow restaurant-related topics"""
+    text_lower = text.lower()
+    domain_keywords = [
+        # food/dishes
+        "recipe", "ingredients", "cook", "prepare", "dish", "menu",
+        "burger", "pizza", "pasta", "salad", "soup", "cake", "bread",
+        "chicken", "beef", "pork", "fish", "rice", "fries", "sandwich",
+        "omelet", "omelette", "mushroom", "mushrooms",
+        # drinks
+        "drink", "juice", "water", "soda", "coffee", "tea",
+        # inventory/ops
+        "inventory", "stock", "available", "availability", "in stock",
+        "order", "orders", "kitchen", "ingredient", "items",
+        # common supplies mentioned by staff
+        "oil", "olive", "olive oil", "cheese", "mushroom", "mushrooms",
+        "cans", "buckets", "salt", "pepper"
+    ]
+    return any(word in text_lower for word in domain_keywords)
+
 # --- Intent Classification ---
 def classify_intent(text: str) -> str:
     """Classify user intent from text"""
     text_lower = text.lower()
-    
-    if any(word in text_lower for word in ["recipe", "how to make", "how to prepare", "how to cook", "ingredients for"]):
+
+    # Out-of-domain early exit
+    if not is_restaurant_domain(text_lower):
+        return "out_of_domain"
+
+    # Recipe/How-to queries (include singular/plural ingredient patterns)
+    if re.search(r"\b(recipe|how to (make|cook|prepare)|how do i (make|cook|prepare)|ingredients?\s+(of|for)|give me the ingredients?\s+(of|for))\b", text_lower):
         return "recipe_request"
-    elif any(word in text_lower for word in ["ingredient", "available", "stock", "have", "need"]):
+
+    # Inventory queries
+    if re.search(r"\b(stock|inventory|available|availability|have|need|how many|do we have|in stock|left|quantity|count|units?)\b", text_lower):
         return "inventory_check"
-    elif any(word in text_lower for word in ["trending", "popular", "recommend", "suggestion"]):
+
+    # Trending/recommendations
+    if re.search(r"\b(trending|popular|recommend|suggestion)\b", text_lower):
         return "trending_request"
-    else:
-        return "general_query"
+
+    return "general_query"
 
 def extract_dish_name(text: str) -> str:
     """Extract dish name from user text"""
@@ -88,6 +118,8 @@ def extract_dish_name(text: str) -> str:
     patterns = [
         r"how to (?:make|cook|prepare)\s+([a-zA-Z\s]+)",
         r"recipe for\s+([a-zA-Z\s]+)",
+        r"ingredients of\s+([a-zA-Z\s]+)",
+        r"ingredient of\s+([a-zA-Z\s]+)",
         r"how to\s+([a-zA-Z\s]+)",
         r"([a-zA-Z\s]+)\s+recipe",
         r"ingredients for\s+([a-zA-Z\s]+)"
@@ -97,11 +129,13 @@ def extract_dish_name(text: str) -> str:
         match = re.search(pattern, text_lower)
         if match:
             dish_name = match.group(1).strip()
+            # remove trailing politeness or filler words
+            dish_name = re.sub(r"\b(please|thanks|thank you|ask)\b$", "", dish_name).strip()
             if dish_name and len(dish_name) > 1:
                 return dish_name
     
     # If no pattern match, try to extract from common food words
-    food_words = ["lemon juice", "pizza", "pasta", "salad", "soup", "cake", "bread", "rice", "chicken", "fish", "beef", "pork"]
+    food_words = ["lemon juice", "pizza", "pasta", "salad", "soup", "cake", "bread", "rice", "chicken", "fish", "beef", "pork", "burger", "mushroom salad"]
     for food in food_words:
         if food in text_lower:
             return food
@@ -116,9 +150,10 @@ def find_closest_ingredient(name: str, inventory_keys: List[str]) -> str:
     return matches[0] if matches else name
 
 def check_inventory_availability(dish: str, inventory: Dict[str, int]) -> str:
-    """Check ingredient availability for a dish"""
-    # This function is simplified since we don't have recipe database
-    return f"I can check ingredient availability for {dish}, but I don't have specific recipe requirements in my database."
+    """Check ingredient availability for a dish using common ingredient lists"""
+    if not inventory:
+        return "The inventory is currently empty."
+    return check_inventory_for_any_dish(dish, inventory)
 
 def get_trending_recipes() -> str:
     """Get trending recipes based on recent queries"""
@@ -169,7 +204,7 @@ def duckduckgo_search(query: str) -> str:
     try:
         url = "https://api.duckduckgo.com/"
         params = {
-            "q": f"{query} recipe ingredients instructions how to make step by step",
+            "q": f"{query} recipe ingredients instructions how to make step by step cooking method preparation",
             "format": "json",
             "no_html": "1",
             "skip_disambig": "1"
@@ -184,16 +219,17 @@ def duckduckgo_search(query: str) -> str:
             abstract = data["Abstract"]
             # Clean up the abstract
             abstract = re.sub(r'\s+', ' ', abstract).strip()
-            if len(abstract) > 50:  # Only return if it's substantial
+            if len(abstract) > 20:  # Lowered threshold to get more results
                 return abstract
         
         # Try to get related topics
         if data.get("RelatedTopics") and len(data["RelatedTopics"]) > 0:
-            for topic in data["RelatedTopics"][:3]:  # Check first 3 topics
+            for topic in data["RelatedTopics"][:8]:  # Check more topics
                 if isinstance(topic, dict) and "Text" in topic:
                     text = topic["Text"]
                     text = re.sub(r'\s+', ' ', text).strip()
-                    if len(text) > 50 and "recipe" in text.lower():
+                    # More flexible matching for recipe content
+                    if len(text) > 20 and any(keyword in text.lower() for keyword in ["recipe", "ingredient", "how to", "cook", "prepare", "make", "step", "method"]):
                         return text
         
         return None
@@ -202,64 +238,20 @@ def duckduckgo_search(query: str) -> str:
         print(f"DuckDuckGo search failed: {e}")
         return None
 
-def google_custom_search(query: str) -> str:
-    """Google Custom Search API (requires API key and search engine ID)"""
-    api_key = os.getenv("GOOGLE_SEARCH_API_KEY")
-    search_engine_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
-    
-    if not api_key or not search_engine_id:
-        return None
-    
-    try:
-        url = "https://www.googleapis.com/customsearch/v1"
-        params = {
-            "key": api_key,
-            "cx": search_engine_id,
-            "q": f"{query} recipe ingredients instructions how to make step by step cooking",
-            "num": 3,  # Get more results
-            "dateRestrict": "m1"  # Recent results (last month)
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "items" in data and len(data["items"]) > 0:
-            snippets = []
-            for item in data["items"][:3]:
-                if "snippet" in item:
-                    snippet = item["snippet"]
-                    # Clean up the snippet
-                    snippet = re.sub(r'\s+', ' ', snippet).strip()
-                    if len(snippet) > 30:  # Only include substantial snippets
-                        snippets.append(snippet)
-            
-            if snippets:
-                combined = " ".join(snippets)
-                combined = re.sub(r'\s+', ' ', combined).strip()
-                # Limit length to avoid overwhelming responses
-                if len(combined) > 500:
-                    combined = combined[:500] + "..."
-                return combined
-                
-    except Exception as e:
-        print(f"Google Custom Search failed: {e}")
-    
-    return None
+# Google Custom Search removed - using only DuckDuckGo for simplicity
 
 def web_search(query: str) -> str:
-    """Multi-source web search with fallbacks"""
+    """Web search using DuckDuckGo Instant Answer API"""
     
-    # Try Google Custom Search first (if configured)
-    google_result = google_custom_search(query)
-    if google_result:
-        return google_result
+    print(f"Starting DuckDuckGo search for: {query}")  # Debug log
     
-    # Fallback to DuckDuckGo (free, no API key required)
+    # Use DuckDuckGo (free, no API key required)
     duckduckgo_result = duckduckgo_search(query)
     if duckduckgo_result:
+        print(f"DuckDuckGo search successful for: {query}")  # Debug log
         return duckduckgo_result
     
+    print(f"DuckDuckGo search failed for: {query}")  # Debug log
     return None
 
 def get_basic_recipe(dish: str) -> str:
@@ -267,11 +259,36 @@ def get_basic_recipe(dish: str) -> str:
     dish_lower = dish.lower()
     
     basic_recipes = {
+        "burger": """Classic Burger Recipe:
+1. Mix 1 lb ground beef with 1 tsp salt, 1/2 tsp pepper, 1/2 tsp garlic powder
+2. Form into 4 equal patties, make thumb indentation in center
+3. Heat oil in pan/grill to medium-high heat
+4. Cook patties 4-5 minutes per side for medium-rare
+5. Add cheese in last minute if desired
+6. Toast buns, assemble with lettuce, tomato, onion, pickles
+7. Serve with ketchup, mustard, and mayo""",
+        
         "pizza": """Pizza Recipe:
 1. Make dough: Mix 3 cups flour, 1 tsp yeast, 1 cup warm water, 1 tsp salt, 1 tbsp olive oil
 2. Knead for 10 minutes, let rise 1 hour
 3. Roll out dough, add tomato sauce, cheese, and toppings
 4. Bake at 450°F (230°C) for 12-15 minutes until golden""",
+        
+        "omelet": """Classic Egg Omelet Recipe:
+1. Beat 3 eggs with 1 tbsp water, salt and pepper to taste
+2. Heat 1 tbsp butter in non-stick pan over medium heat
+3. Pour in beaten eggs, let set for 30 seconds
+4. Add fillings (cheese, vegetables, meat) to one half
+5. Fold other half over, cook 1-2 minutes until set
+6. Slide onto plate and serve immediately""",
+        
+        "egg omelet": """Classic Egg Omelet Recipe:
+1. Beat 3 eggs with 1 tbsp water, salt and pepper to taste
+2. Heat 1 tbsp butter in non-stick pan over medium heat
+3. Pour in beaten eggs, let set for 30 seconds
+4. Add fillings (cheese, vegetables, meat) to one half
+5. Fold other half over, cook 1-2 minutes until set
+6. Slide onto plate and serve immediately""",
         
         "lemon juice": """Lemon Juice Recipe:
 1. Wash and roll 4-6 fresh lemons on counter to release juice
@@ -298,7 +315,13 @@ def get_basic_recipe(dish: str) -> str:
 1. Mix 3 cups flour, 1 tsp yeast, 1 tsp salt, 1 tbsp sugar
 2. Add 1 cup warm water, knead for 10 minutes
 3. Let rise 1 hour, punch down, shape
-4. Rise again 30 minutes, bake at 400°F (200°C) for 30 minutes"""
+4. Rise again 30 minutes, bake at 400°F (200°C) for 30 minutes""",
+        
+        "mushroom salad": """Simple Mushroom Salad Recipe:
+1. Clean and slice 8 oz fresh mushrooms
+2. Mix with 2 tbsp olive oil, 1 tbsp lemon juice, salt and pepper
+3. Add 1/4 cup chopped parsley and 2 tbsp grated parmesan
+4. Let marinate 15 minutes, serve chilled"""
     }
     
     # Find best match
@@ -318,10 +341,18 @@ def get_basic_recipe(dish: str) -> str:
 def check_inventory_for_any_dish(dish: str, inventory: Dict[str, int]) -> str:
     """Check ingredient availability for any dish (not just database recipes)"""
     if not inventory:
-        return "No ingredient data available."
+        return f"You don't have the ingredients needed for {dish}. The inventory is currently empty."
     
     # Common ingredients for different dish types
     common_ingredients = {
+        "burger": [
+            "bun", "buns", "beef", "beef patty", "patty", "cheese", "lettuce",
+            "tomato", "onion", "pickles", "ketchup", "mustard", "mayo",
+            "oil", "salt", "pepper"
+        ],
+        "omelet": ["eggs", "butter", "salt", "pepper", "water", "cheese", "vegetables"],
+        "egg omelet": ["eggs", "butter", "salt", "pepper", "water", "cheese", "vegetables"],
+        "mushroom salad": ["mushrooms", "olive oil", "lemon juice", "salt", "pepper", "parsley", "parmesan"],
         "pizza": ["flour", "yeast", "water", "salt", "olive oil", "tomato", "cheese", "basil"],
         "lemon juice": ["lemon", "water", "sugar", "salt"],
         "pasta": ["flour", "eggs", "salt", "olive oil", "tomato", "cheese"],
@@ -361,7 +392,7 @@ def check_inventory_for_any_dish(dish: str, inventory: Dict[str, int]) -> str:
 def analyze_ingredients(required_ingredients: List[str], inventory: Dict[str, int], dish: str) -> str:
     """Analyze ingredient availability and provide detailed feedback"""
     if not inventory:
-        return f"No ingredient data available for {dish}."
+        return f"You don't have the ingredients needed for {dish}. The inventory is currently empty."
     
     available = []
     missing = []
@@ -391,24 +422,84 @@ def analyze_ingredients(required_ingredients: List[str], inventory: Dict[str, in
         response_parts.append(f"Low stock: {', '.join(low_stock)}")
     
     if missing:
-        response_parts.append(f"Missing: {', '.join(missing)}")
+        if len(missing) == 1:
+            response_parts.append(f"You miss ingredient: {missing[0]}")
+        else:
+            response_parts.append(f"You miss ingredients: {', '.join(missing)}")
     
     if not response_parts:
         response_parts.append("No ingredient information available.")
     
     return " | ".join(response_parts)
 
+
+def _generate_ngrams(tokens: List[str], n: int = 2) -> Set[str]:
+    ngrams: Set[str] = set()
+    for i in range(len(tokens) - n + 1):
+        ngrams.add(" ".join(tokens[i : i + n]))
+    return ngrams
+
+
+def analyze_inventory_query(user_text: str, inventory: Dict[str, int]) -> str:
+    """Answer direct inventory questions for specific items mentioned in the text."""
+    if db is not None and not inventory:
+        # DB connected but no items present
+        return "The inventory is currently empty."
+
+    if not inventory:
+        return "No inventory data available."
+
+    text_lower = user_text.lower()
+    tokens = re.findall(r"[a-zA-Z]+", text_lower)
+    tokens = [t for t in tokens if t not in {"how", "to", "make", "cook", "prepare", "the", "a", "an", "and", "of", "for", "do", "we", "have", "any", "is", "there", "stock", "in", "our", "restaurant", "available", "availability", "left", "many", "quantity", "count", "units", "unit", "give", "me"}]
+
+    bigrams = _generate_ngrams(tokens, 2)
+    candidate_terms: Set[str] = set(tokens) | bigrams
+
+    inventory_keys = list(inventory.keys())
+    matched: List[Tuple[str, int]] = []
+
+    # Direct substring matches first
+    for key in inventory_keys:
+        if key in text_lower:
+            matched.append((key, inventory[key]))
+
+    # Fuzzy match for remaining
+    matched_keys = {k for k, _ in matched}
+    for term in candidate_terms:
+        if any(term in k or k in term for k in matched_keys):
+            continue
+        close = get_close_matches(term, inventory_keys, n=1, cutoff=0.82)
+        if close:
+            key = close[0]
+            if key not in matched_keys:
+                matched.append((key, inventory[key]))
+                matched_keys.add(key)
+
+    if not matched:
+        # Provide a helpful hint if no terms matched
+        sample = ", ".join(list(inventory.keys())[:5]) if inventory else ""
+        hint = f" Known inventory items include: {sample}." if sample else ""
+        return "I couldn't find those items in the inventory." + hint
+
+    # Build concise response
+    parts = [f"{name}: {qty}" for name, qty in matched]
+    return " | ".join(parts)
+
 async def get_recipe_with_fallback(dish: str, user_text: str, inventory: Dict[str, int]):
     """Get recipe with web search fallback"""
     
-    # Always search web first for recipes
+    # Always search web first for recipes (prioritize web search for all dishes)
+    print(f"Searching web for recipe: {dish}")  # Debug log
     web_result = web_search(dish)
     
     if web_result:
+        print(f"Web search successful for {dish}")  # Debug log
         # Check ingredient availability
         availability_info = check_inventory_for_any_dish(dish, inventory)
         return f"{web_result}\n\n{availability_info}"
     
+    print(f"Web search failed for {dish}, using fallback recipe")  # Debug log
     # If web search fails, provide basic cooking tips
     fallback_help = get_basic_recipe(dish)
     availability_info = check_inventory_for_any_dish(dish, inventory)
@@ -421,6 +512,10 @@ async def restaurant_agent(user_text: str, inventory: Dict[str, int], is_audio: 
     intent = classify_intent(user_text)
     dish = extract_dish_name(user_text)
     
+    # Domain guard response
+    if intent == "out_of_domain":
+        return "I can only answer restaurant topics such as recipes, ingredients, menu items, and inventory."
+
     if intent == "recipe_request":
         if dish:
             log_query(user_text, dish)
@@ -429,10 +524,17 @@ async def restaurant_agent(user_text: str, inventory: Dict[str, int], is_audio: 
             return "I'd be happy to help you with a recipe! Could you please specify what dish you'd like to make? For example: 'How to make lemon juice' or 'Recipe for pizza'."
     
     elif intent == "inventory_check":
+        # First, try to answer about specific items in the inventory mentioned in the query
+        item_response = analyze_inventory_query(user_text, inventory)
+        # If we found concrete items, return that; otherwise, if a dish is specified, analyze dish ingredients
+        if item_response and not item_response.startswith("I couldn't find"):
+            return item_response
         if dish:
             return check_inventory_availability(dish, inventory)
-        else:
-            return "Please specify which dish you'd like me to check ingredients for."
+        # Fallback prompt
+        if db is not None and not inventory:
+            return "The inventory is currently empty."
+        return "Tell me which items or dish you want me to check in the inventory."
     
     elif intent == "trending_request":
         return get_trending_recipes()
